@@ -2,7 +2,7 @@
   (vim.cmd "normal! gv\"xy")
   (vim.fn.trim (vim.fn.getreg "x")))
 
-(fn write_selection_to_tmp_file []
+(fn write_selection_text_to_tmp_file []
   "Read selection text and write to temp file"
   ;; read selection_text
   (local selection_text (get_selection_text))
@@ -16,14 +16,10 @@
     (os.execute (.. "chmod 777 " tmp_file)))
   tmp_file)
 
-(local state {:bufid nil :winid nil})
+;; === Task Spec ===
+;; {: cmd : result : process : start_time : finish_time}
 
-(fn buffer_append [lines]
-  (local {: bufid : winid} state)
-  (var line_start (vim.api.nvim_buf_line_count bufid))
-  (when (= 1 line_start) (set line_start 0))
-  (vim.api.nvim_buf_set_lines bufid line_start -1 false lines)
-  (vim.api.nvim_win_set_cursor winid [(vim.api.nvim_buf_line_count bufid) 0]))
+(local state {:bufid nil :winid nil :task_list []})
 
 (fn ensure_buf_and_win []
   (var {: bufid : winid} state)
@@ -39,40 +35,81 @@
   (set state.winid winid)
   nil)
 
-(fn title_lines [cmd]
-  (local time_str (os.date "!%m-%d %H:%M:%S" (os.time)))
+(fn buffer_clear []
+  (vim.api.nvim_buf_set_text state.bufid 0 0 -1 -1 []))
+
+(fn buffer_append [lines]
+  (local {: bufid : winid} state)
+  (var line_start (vim.api.nvim_buf_line_count bufid))
+  (when (= 1 line_start) (set line_start 0))
+  (vim.api.nvim_buf_set_lines bufid line_start -1 false lines)
+  (vim.api.nvim_win_set_cursor winid [(vim.api.nvim_buf_line_count bufid) 0])
+  nil)
+
+(fn title_lines [cmd start_time]
+  (local time_str (os.date "!%m-%d %H:%M:%S" start_time))
   [(.. "# " (string.rep "-" 80))
    (.. "# " time_str " - " (table.concat cmd " "))])
 
-(fn result_lines [{: code : stdout : stderr}]
+(fn result_lines [elapsed {: code : stdout : stderr}]
+  (local status_text
+         (case code
+           0 (.. "# 🎉 Good job" " (" elapsed "s) ")
+           code (.. "# 💀 Code: " code " (" elapsed "s) ")))
   (local text (case code
                 0 stdout
-                code (.. "💀 Code: " code "\n"
-                         (if (not= stderr "") stderr stdout))))
-  (-> text
-      (string.gsub "\027%[.-m" "")
-      (case (a _) a)
-      vim.fn.trim
-      (vim.fn.split "\n" true)))
+                code (if (not= stderr "") stderr stdout)))
+  (vim.list_extend [status_text]
+                   (-> text
+                       (string.gsub "\027%[.-m" "")
+                       (case (a _) a)
+                       vim.fn.trim
+                       (vim.fn.split "\n" true))))
+
+(fn log_task [{: cmd : result : start_time : finish_time}]
+  (buffer_append (title_lines cmd start_time))
+  (if (= nil result)
+      (buffer_append ["⏳ running..."])
+      (buffer_append (result_lines (- finish_time start_time) result)))
+  nil)
+
+(fn log_task_list []
+  (local {: task_list} state)
+  (buffer_clear)
+  (each [_ task (ipairs task_list)]
+    (log_task task)))
+
+(fn on_state_changed []
+  (ensure_buf_and_win)
+  (log_task_list)
+  nil)
+
+(fn add_task [task]
+  (table.insert state.task_list task)
+  (on_state_changed))
+
+(fn update_task_result [task res]
+  (set task.result res)
+  (set task.finish_time (os.time))
+  (on_state_changed))
+
+(fn run_visual [{: fargs}]
+  (local tmp_file (write_selection_text_to_tmp_file))
+  (local cmd [(unpack fargs) tmp_file])
+  (local task {:cmd cmd :start_time (os.time)})
+  (add_task task)
+
+  (fn on_exit [obj]
+    (update_task_result task obj))
+
+  (local (ok? res) (pcall vim.system cmd {:text true}
+                          (vim.schedule_wrap on_exit)))
+  (if ok?
+      (set task.process res)
+      (update_task_result task {:code 999 :stderr res :stdout ""})))
 
 (fn create_user_cmds [bufid]
-  (vim.api.nvim_buf_create_user_command bufid :RunVisual
-                                        (fn [{: fargs}]
-                                          ;; make cmd
-                                          (local tmp_file
-                                                 (write_selection_to_tmp_file))
-                                          (local cmd [(unpack fargs) tmp_file])
-                                          ;; open buffer window to waiting for cmd result
-                                          (ensure_buf_and_win)
-                                          ;; append title_lines to buffer
-                                          (buffer_append (title_lines cmd))
-
-                                          (fn log_result [obj]
-                                            (buffer_append (result_lines obj)))
-
-                                          ;; run cmd
-                                          (vim.system cmd {:text true}
-                                                      (vim.schedule_wrap log_result)))
+  (vim.api.nvim_buf_create_user_command bufid :RunVisual run_visual
                                         {:nargs "+" :range true})
   nil)
 
